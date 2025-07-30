@@ -1,0 +1,210 @@
+#region Configuration Parameters
+$DaysToLookBack = 2                 # Analyze logs from the last N days
+$MaxRunsPerScenario = 3             # Max valid runs to extract per scenario
+$ReportOutputPath = "C:\LogReports" # Where to save the HTML file
+$SendEmail = $false                 # Set to true to email the report
+$SMTPSettings = @{}                 # Only needed if emailing
+$DebugLog = Join-Path $ReportOutputPath "debug.log"
+
+#region Utility Functions
+function Write-DebugLog {
+    param($Message)
+    Add-Content -Path $DebugLog -Value ("[{0}] {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message)
+}
+
+function Import-Scenarios {
+    param($Path = "scenarios.csv")
+    try {
+        Import-Csv -Path $Path
+    } catch {
+        Write-DebugLog "Failed to import scenarios.csv: $_"
+        return @()
+    }
+}
+
+function Import-ErrorKeywords {
+    param($Path = "errors.csv")
+    try {
+        (Import-Csv -Path $Path).ErrorKeyword | Where-Object { $_ -ne '' }
+    } catch {
+        Write-DebugLog "Failed to import errors.csv: $_"
+        return @()
+    }
+}
+
+function Get-RecentLogFilesDescending {
+    param($LogDir)
+    try {
+        Get-ChildItem -Path $LogDir -Filter *.log -File |
+            Where-Object { $_.LastWriteTime -ge (Get-Date).AddDays(-$DaysToLookBack) } |
+            Sort-Object LastWriteTime -Descending
+    } catch {
+        Write-DebugLog "Failed to get log files in $LogDir: $_"
+        return @()
+    }
+}
+
+function Read-LogFileReverse {
+    param($LogFile)
+    try {
+        [array]::Reverse(($lines = Get-Content -Path $LogFile -Raw -ErrorAction Stop -Encoding UTF8).Split("`n"))
+        return $lines
+    } catch {
+        Write-DebugLog "Failed to read log file $LogFile: $_"
+        return @()
+    }
+}
+
+function Detect-RunsInLog {
+    param($Lines, $ErrorKeywords)
+    $runs = @()
+    $currentRun = $null
+    $startPattern = '^(?<ts>\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}\.\d{3})\s+Starting Connect-It'
+    $endPattern = '^(?<ts>\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}\.\d{3})\s+Operation completed \(RC=(?<rc>\d+)\)'
+    for ($i = 0; $i -lt $Lines.Count; $i++) {
+        $line = $Lines[$i]
+        if ($line -match $endPattern) {
+            $currentRun = @{
+                EndTime = $matches['ts']
+                RC = $matches['rc']
+                EndIdx = $i
+                Errors = @()
+                ErrorCount = 0
+                Status = if ($matches['rc'] -eq '0') { 'Success' } else { 'Failed' }
+            }
+        } elseif ($line -match $startPattern -and $currentRun) {
+            $currentRun.StartTime = $matches['ts']
+            $currentRun.StartIdx = $i
+            # Extract run lines
+            $runLines = $Lines[$currentRun.EndIdx..$currentRun.StartIdx]
+            $foundKeywords = @()
+            foreach ($kw in $ErrorKeywords) {
+                $matchesCount = ($runLines | Select-String -Pattern $kw -SimpleMatch).Count
+                if ($matchesCount -gt 0) { $foundKeywords += $kw }
+                $currentRun.ErrorCount += $matchesCount
+            }
+            $currentRun.KeywordsFound = $foundKeywords -join ', '
+            $currentRun.Status = if ($currentRun.Status -eq 'Success') { 'Success' } elseif ($currentRun.ErrorCount -gt 0) { 'Failed' } else { $currentRun.Status }
+            $runs += $currentRun
+            $currentRun = $null
+        }
+    }
+    # Handle incomplete run
+    if ($currentRun) {
+        $currentRun.Status = 'Incomplete'
+        $runs += $currentRun
+    }
+    return $runs
+}
+
+function Calculate-RunDuration {
+    param($Start, $End)
+    try {
+        $startDT = [datetime]::ParseExact($Start, 'yyyy/MM/dd HH:mm:ss.fff', $null)
+        $endDT = [datetime]::ParseExact($End, 'yyyy/MM/dd HH:mm:ss.fff', $null)
+        return ($endDT - $startDT).ToString()
+    } catch {
+        Write-DebugLog "Failed to parse duration: $_"
+        return ''
+    }
+}
+
+function Get-LastSuccessTimestamp {
+    param($Runs)
+    $success = $Runs | Where-Object { $_.Status -eq 'Success' } | Sort-Object EndTime -Descending | Select-Object -First 1
+    if ($success) {
+        try {
+            return [datetime]::ParseExact($success.EndTime, 'yyyy/MM/dd HH:mm:ss.fff', $null)
+        } catch {
+            Write-DebugLog "Failed to parse last success timestamp: $_"
+            return $null
+        }
+    }
+    return $null
+}
+
+function Generate-HTMLReport {
+    param($ScenarioResults)
+    $date = Get-Date -Format 'yyyyMMdd'
+    $htmlPath = Join-Path $ReportOutputPath "summary-$date.html"
+    $html = @"
+<html><head><title>Scenario Execution Report $date</title>
+<style>
+table { border-collapse: collapse; width: 100%; }
+th, td { border: 1px solid #ccc; padding: 6px; text-align: left; }
+th { background: #eee; }
+.success { background: #cfc; }
+.failed { background: #fcc; }
+.incomplete { background: #ffc; }
+</style></head><body>
+<h1>Scenario Execution Report - $date</h1>
+"@
+    foreach ($result in $ScenarioResults) {
+        $html += "<h2>$($result.ScenarioName)</h2>"
+        $html += "<table><tr><th>Run Date</th><th>Start Time</th><th>End Time</th><th>Duration</th><th>Status</th><th>Error Count</th><th>Time Since Last Success</th><th>Keywords Found</th><th>Log File</th></tr>"
+        foreach ($run in $result.Runs) {
+            $rowClass = switch ($run.Status) {
+                'Success' { 'success' }
+                'Failed' { 'failed' }
+                'Incomplete' { 'incomplete' }
+                default { '' }
+            }
+            $html += "<tr class='$rowClass'><td>$($run.EndTime.Split(' ')[0])</td><td>$($run.StartTime)</td><td>$($run.EndTime)</td><td>$($run.Duration)</td><td>$($run.Status)</td><td>$($run.ErrorCount)</td><td>$($run.TimeSinceLastSuccess)</td><td>$($run.KeywordsFound)</td><td>$($run.LogFile)</td></tr>"
+        }
+        $html += "</table>"
+    }
+    $html += "</body></html>"
+    $null = New-Item -ItemType Directory -Path $ReportOutputPath -Force
+    Set-Content -Path $htmlPath -Value $html -Encoding UTF8
+    return $htmlPath
+}
+
+function Send-EmailReport {
+    param($HtmlPath)
+    # Only if $SendEmail is true and $SMTPSettings is set
+    if ($SendEmail -and $SMTPSettings.Count -gt 0) {
+        try {
+            $body = Get-Content -Path $HtmlPath -Raw
+            Send-MailMessage @SMTPSettings -Body $body -BodyAsHtml -Subject "Scenario Execution Report" -Attachments $HtmlPath
+        } catch {
+            Write-DebugLog "Failed to send email: $_"
+        }
+    }
+}
+
+#endregion
+
+#region Main Logic
+$scenarios = Import-Scenarios
+$errorKeywords = Import-ErrorKeywords
+$ScenarioResults = @()
+foreach ($scenario in $scenarios) {
+    $logFiles = Get-RecentLogFilesDescending -LogDir $scenario.LogFilePath
+    $allRuns = @()
+    foreach ($logFile in $logFiles) {
+        $lines = Read-LogFileReverse -LogFile $logFile.FullName
+        $runs = Detect-RunsInLog -Lines $lines -ErrorKeywords $errorKeywords
+        foreach ($run in $runs) {
+            $run.LogFile = $logFile.Name
+            $run.Duration = if ($run.StartTime -and $run.EndTime) { Calculate-RunDuration $run.StartTime $run.EndTime } else { '' }
+            $allRuns += $run
+            if ($allRuns.Count -ge $MaxRunsPerScenario) { break }
+        }
+        if ($allRuns.Count -ge $MaxRunsPerScenario) { break }
+    }
+    $lastSuccess = Get-LastSuccessTimestamp -Runs $allRuns
+    foreach ($run in $allRuns) {
+        if ($lastSuccess -and $run.Status -eq 'Success') {
+            $run.TimeSinceLastSuccess = (New-TimeSpan -Start $lastSuccess -End (Get-Date)).ToString()
+        } else {
+            $run.TimeSinceLastSuccess = ''
+        }
+    }
+    $ScenarioResults += [PSCustomObject]@{
+        ScenarioName = $scenario.ScenarioName
+        Runs = $allRuns
+    }
+}
+$htmlPath = Generate-HTMLReport -ScenarioResults $ScenarioResults
+Send-EmailReport -HtmlPath $htmlPath
+#endregion

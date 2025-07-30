@@ -145,20 +145,24 @@ function Detect-RunsInLog {
     Write-DebugLog "Analyzing $($Lines.Count) lines for scenario runs"
     
     $runs = @()
-    $currentRun = $null
-    # More flexible timestamp patterns to handle different formats
-    $startPattern = '^(?<ts>\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}(?:\.\d{3})?)\s+.*Starting Connect-It'
-    $endPattern = '^(?<ts>\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}(?:\.\d{3})?)\s+.*Operation completed.*\(RC=(?<rc>\d+)\)'
+    # More flexible patterns to handle various timestamp and log formats
+    # Pattern handles: YYYY/MM/DD HH:MM:SS.sss or YYYY/MM/DD HH:MM:S.sss (single digit seconds)
+    $startPattern = '(?<ts>\d{4}/\d{2}/\d{2}\s+\d{1,2}:\d{1,2}:\d{1,2}(?:\.\d{1,3})?)\s+.*Starting\s+Connect-It'
+    $endPattern = '(?<ts>\d{4}/\d{2}/\d{2}\s+\d{1,2}:\d{1,2}:\d{1,2}(?:\.\d{1,3})?)\s+.*Operation\s+completed.*RC=(?<rc>\d+)'
     
     Write-DebugLog "Using patterns - Start: '$startPattern', End: '$endPattern'"
     
     # Add debug logging for first few lines to see actual format
     Write-DebugLog "Sample lines for pattern matching:"
-    for ($j = 0; $j -lt [Math]::Min(10, $Lines.Count); $j++) {
+    for ($j = 0; $j -lt [Math]::Min(20, $Lines.Count); $j++) {
         if (![string]::IsNullOrWhiteSpace($Lines[$j])) {
             Write-DebugLog "  Line $j`: $($Lines[$j].Trim())"
         }
     }
+    
+    # First pass: Find all START and END markers with their positions and timestamps
+    $startMarkers = @()
+    $endMarkers = @()
     
     for ($i = 0; $i -lt $Lines.Count; $i++) {
         $line = $Lines[$i].Trim()
@@ -168,27 +172,133 @@ function Detect-RunsInLog {
             continue
         }
         
-        if ($line -match $endPattern) {
-            Write-DebugLog "Found END marker at line ${i}: $line"
-            $currentRun = @{
-                EndTime = $matches['ts']
-                RC = $matches['rc']
-                EndIdx = $i
-                Errors = @()
-                ErrorCount = 0
-                Status = if ($matches['rc'] -eq '0') { 'Success' } else { 'Failed' }
+        # Test START pattern with detailed debugging
+        if ($line -match $startPattern) {
+            $startMarkers += @{
+                LineIndex = $i
+                Timestamp = $matches['ts'].Trim()
+                Line = $line
+                ParsedTime = $null
             }
-            Write-DebugLog "  - EndTime: $($currentRun.EndTime), RC: $($currentRun.RC), Status: $($currentRun.Status)"
-        } elseif ($line -match $startPattern -and $currentRun) {
-            Write-DebugLog "Found START marker at line ${i}: $line"
-            $currentRun.StartTime = $matches['ts']
-            $currentRun.StartIdx = $i
-            Write-DebugLog "  - StartTime: $($currentRun.StartTime)"
+            Write-DebugLog "Found START marker at line ${i}: '$($matches['ts'].Trim())'"
+        }
+        # Test END pattern with detailed debugging  
+        elseif ($line -match $endPattern) {
+            $endMarkers += @{
+                LineIndex = $i
+                Timestamp = $matches['ts'].Trim()
+                RC = $matches['rc']
+                Line = $line
+                ParsedTime = $null
+            }
+            Write-DebugLog "Found END marker at line ${i}: '$($matches['ts'].Trim())' RC=$($matches['rc'])"
+        }
+        # Debug lines that contain keywords but don't match patterns
+        elseif ($line -like "*Starting Connect-It*") {
+            Write-DebugLog "WARNING: Line contains 'Starting Connect-It' but doesn't match pattern: $line"
+        }
+        elseif ($line -like "*Operation completed*") {
+            Write-DebugLog "WARNING: Line contains 'Operation completed' but doesn't match pattern: $line"
+        }
+    }
+    
+    Write-DebugLog "Found $($startMarkers.Count) START markers and $($endMarkers.Count) END markers"
+    
+    # Parse timestamps for comparison - handle multiple formats
+    foreach ($marker in ($startMarkers + $endMarkers)) {
+        $timestamp = $marker.Timestamp.Trim()
+        Write-DebugLog "Attempting to parse timestamp: '$timestamp'"
+        
+        # Try multiple timestamp formats
+        $formats = @(
+            'yyyy/MM/dd HH:mm:ss.fff',
+            'yyyy/MM/dd HH:mm:ss.ff', 
+            'yyyy/MM/dd HH:mm:ss.f',
+            'yyyy/MM/dd HH:mm:ss',
+            'yyyy/MM/dd H:mm:ss.fff',
+            'yyyy/MM/dd H:mm:ss.ff',
+            'yyyy/MM/dd H:mm:ss.f',
+            'yyyy/MM/dd H:mm:ss',
+            'yyyy/MM/dd HH:mm:s.fff',
+            'yyyy/MM/dd HH:mm:s.ff',
+            'yyyy/MM/dd HH:mm:s.f',
+            'yyyy/MM/dd HH:mm:s',
+            'yyyy/MM/dd H:mm:s.fff',
+            'yyyy/MM/dd H:mm:s.ff',
+            'yyyy/MM/dd H:mm:s.f',
+            'yyyy/MM/dd H:mm:s'
+        )
+        
+        $parsed = $false
+        foreach ($format in $formats) {
+            try {
+                $marker.ParsedTime = [datetime]::ParseExact($timestamp, $format, $null)
+                Write-DebugLog "Successfully parsed '$timestamp' using format '$format' -> $($marker.ParsedTime)"
+                $parsed = $true
+                break
+            } catch {
+                # Continue to next format
+            }
+        }
+        
+        if (-not $parsed) {
+            Write-DebugLog "WARNING: Could not parse timestamp '$timestamp' with any known format"
+            $marker.ParsedTime = $null
+        }
+    }
+    
+    # Sort markers by line index (since lines are already reversed, this gives us newest first)
+    $startMarkers = $startMarkers | Sort-Object LineIndex
+    $endMarkers = $endMarkers | Sort-Object LineIndex
+    
+    Write-DebugLog "Processing markers to find valid start-end pairs..."
+    
+    # Process each END marker and find its corresponding START marker
+    foreach ($endMarker in $endMarkers) {
+        Write-DebugLog "Processing END marker at line $($endMarker.LineIndex): $($endMarker.Timestamp)"
+        
+        # Find the next START marker that comes after this END marker (chronologically before, since lines are reversed)
+        $matchingStart = $null
+        foreach ($startMarker in $startMarkers) {
+            # The start marker should be at a higher line index (later in the reversed array = earlier in time)
+            if ($startMarker.LineIndex -gt $endMarker.LineIndex) {
+                # Validate timestamps: start time should be less than end time
+                if ($startMarker.ParsedTime -and $endMarker.ParsedTime) {
+                    if ($startMarker.ParsedTime -lt $endMarker.ParsedTime) {
+                        $matchingStart = $startMarker
+                        Write-DebugLog "  - Found matching START at line $($startMarker.LineIndex): $($startMarker.Timestamp)"
+                        break
+                    } else {
+                        Write-DebugLog "  - START at line $($startMarker.LineIndex) has time $($startMarker.Timestamp) which is >= END time $($endMarker.Timestamp) - INVALID"
+                    }
+                } else {
+                    # If we can't parse timestamps, assume the first START after END is the match
+                    $matchingStart = $startMarker
+                    Write-DebugLog "  - Found START at line $($startMarker.LineIndex) (timestamp parsing failed, assuming valid)"
+                    break
+                }
+            }
+        }
+        
+        if ($matchingStart) {
+            # Create a valid run
+            $run = @{
+                StartTime = $matchingStart.Timestamp
+                EndTime = $endMarker.Timestamp
+                RC = $endMarker.RC
+                StartIdx = $matchingStart.LineIndex
+                EndIdx = $endMarker.LineIndex
+                Status = if ($endMarker.RC -eq '0') { 'Success' } else { 'Failed' }
+                ErrorCount = 0
+                KeywordsFound = ''
+                Errors = @()
+            }
             
-            # Extract run lines between start and end
-            $runLines = $Lines[$currentRun.EndIdx..$currentRun.StartIdx]
-            Write-DebugLog "  - Extracted $($runLines.Count) lines for this run"
+            # Extract run lines between start and end for error analysis
+            $runLines = $Lines[$endMarker.LineIndex..$matchingStart.LineIndex]
+            Write-DebugLog "  - Extracted $($runLines.Count) lines for error analysis"
             
+            # Analyze error keywords
             $foundKeywords = @()
             foreach ($kw in $ErrorKeywords) {
                 $matchesCount = ($runLines | Select-String -Pattern $kw -SimpleMatch).Count
@@ -196,28 +306,41 @@ function Detect-RunsInLog {
                     $foundKeywords += $kw 
                     Write-DebugLog "  - Found $matchesCount occurrences of keyword '$kw'"
                 }
-                $currentRun.ErrorCount += $matchesCount
+                $run.ErrorCount += $matchesCount
             }
-            $currentRun.KeywordsFound = $foundKeywords -join ', '
+            $run.KeywordsFound = $foundKeywords -join ', '
             
             # Update status based on error keywords found
-            if ($currentRun.Status -eq 'Success' -and $currentRun.ErrorCount -gt 0) {
-                $currentRun.Status = 'Success with Warnings'
-                Write-DebugLog "  - Status updated to 'Success with Warnings' due to error keywords found"
+            if ($run.Status -eq 'Success' -and $run.ErrorCount -gt 0) {
+                $run.Status = 'Success with Warnings'
+                Write-DebugLog "  - Status updated to 'Success with Warnings' due to error keywords"
             }
             
-            Write-DebugLog "  - Final Status: $($currentRun.Status), ErrorCount: $($currentRun.ErrorCount), Keywords: $($currentRun.KeywordsFound)"
+            Write-DebugLog "  - Created run: Status=$($run.Status), Start=$($run.StartTime), End=$($run.EndTime), Errors=$($run.ErrorCount)"
+            $runs += $run
             
-            $runs += $currentRun
-            $currentRun = $null
+            # Remove the used START marker so it can't be matched again
+            $startMarkers = $startMarkers | Where-Object { $_.LineIndex -ne $matchingStart.LineIndex }
+        } else {
+            Write-DebugLog "  - No matching START found for END at line $($endMarker.LineIndex) - orphaned END marker"
         }
     }
     
-    # Handle incomplete run (found end but no start)
-    if ($currentRun) {
-        Write-DebugLog "Found incomplete run (end marker without start marker)"
-        $currentRun.Status = 'Incomplete'
-        $runs += $currentRun
+    # Check for unmatched START markers (scenarios that started but didn't complete)
+    foreach ($startMarker in $startMarkers) {
+        Write-DebugLog "Found unmatched START marker at line $($startMarker.LineIndex): $($startMarker.Timestamp) - marking as Incomplete"
+        $run = @{
+            StartTime = $startMarker.Timestamp
+            EndTime = $null
+            RC = $null
+            StartIdx = $startMarker.LineIndex
+            EndIdx = $null
+            Status = 'Incomplete'
+            ErrorCount = 0
+            KeywordsFound = 'Scenario started but not completed'
+            Errors = @()
+        }
+        $runs += $run
     }
     
     Write-DebugLog "Total runs detected: $($runs.Count)"

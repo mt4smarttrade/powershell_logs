@@ -4,66 +4,158 @@ $MaxRunsPerScenario = 3             # Max valid runs to extract per scenario
 $ReportOutputPath = "C:\LogReports" # Where to save the HTML file
 $SendEmail = $false                 # Set to true to email the report
 $SMTPSettings = @{}                 # Only needed if emailing
+
+# Ensure debug log directory exists before creating debug log path
+if (!(Test-Path $ReportOutputPath)) {
+    New-Item -ItemType Directory -Path $ReportOutputPath -Force | Out-Null
+}
 $DebugLog = Join-Path $ReportOutputPath "debug.log"
+
+# Clear previous debug log
+if (Test-Path $DebugLog) {
+    Remove-Item $DebugLog -Force
+}
 
 #region Utility Functions
 function Write-DebugLog {
     param($Message)
-    Add-Content -Path $DebugLog -Value ("[{0}] {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message)
+    try {
+        Add-Content -Path $DebugLog -Value ("[{0}] {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message)
+        Write-Host "[DEBUG] $Message" -ForegroundColor Yellow
+    } catch {
+        Write-Host "[DEBUG ERROR] Failed to write to debug log: $_" -ForegroundColor Red
+    }
 }
 
 function Import-Scenarios {
     param($Path = "scenarios.csv")
+    Write-DebugLog "Attempting to import scenarios from: $Path"
+    
+    if (!(Test-Path $Path)) {
+        Write-DebugLog "ERROR: Scenarios file not found: $Path"
+        Write-Host "ERROR: Scenarios file not found: $Path" -ForegroundColor Red
+        return @()
+    }
+    
     try {
-        Import-Csv -Path $Path
+        $scenarios = Import-Csv -Path $Path
+        Write-DebugLog "Successfully imported $($scenarios.Count) scenarios"
+        foreach ($scenario in $scenarios) {
+            Write-DebugLog "  - Scenario: $($scenario.ScenarioName), LogPath: $($scenario.LogFilePath)"
+        }
+        return $scenarios
     } catch {
-        Write-DebugLog "Failed to import scenarios.csv: $_"
+        Write-DebugLog "Failed to import scenarios.csv: $($_.Exception.Message)"
+        Write-Host "ERROR: Failed to import scenarios.csv: $($_.Exception.Message)" -ForegroundColor Red
         return @()
     }
 }
 
 function Import-ErrorKeywords {
     param($Path = "errors.csv")
+    Write-DebugLog "Attempting to import error keywords from: $Path"
+    
+    if (!(Test-Path $Path)) {
+        Write-DebugLog "ERROR: Error keywords file not found: $Path"
+        Write-Host "ERROR: Error keywords file not found: $Path" -ForegroundColor Red
+        return @()
+    }
+    
     try {
-        (Import-Csv -Path $Path).ErrorKeyword | Where-Object { $_ -ne '' }
+        $keywords = (Import-Csv -Path $Path).ErrorKeyword | Where-Object { $_ -ne '' }
+        Write-DebugLog "Successfully imported $($keywords.Count) error keywords: $($keywords -join ', ')"
+        return $keywords
     } catch {
-        Write-DebugLog "Failed to import errors.csv: $_"
+        Write-DebugLog "Failed to import errors.csv: $($_.Exception.Message)"
+        Write-Host "ERROR: Failed to import errors.csv: $($_.Exception.Message)" -ForegroundColor Red
         return @()
     }
 }
 
 function Get-RecentLogFilesDescending {
     param($LogDir)
+    Write-DebugLog "Searching for log files in directory: $LogDir"
+    
+    if (!(Test-Path $LogDir)) {
+        Write-DebugLog "ERROR: Log directory does not exist: $LogDir"
+        Write-Host "ERROR: Log directory does not exist: $LogDir" -ForegroundColor Red
+        return @()
+    }
+    
     try {
-        Get-ChildItem -Path $LogDir -Filter *.log -File |
-            Where-Object { $_.LastWriteTime -ge (Get-Date).AddDays(-$DaysToLookBack) } |
-            Sort-Object LastWriteTime -Descending
+        $cutoffDate = (Get-Date).AddDays(-$DaysToLookBack)
+        Write-DebugLog "Looking for .log files modified after: $cutoffDate"
+        
+        $allLogFiles = Get-ChildItem -Path $LogDir -Filter *.log -File -ErrorAction Stop
+        Write-DebugLog "Found $($allLogFiles.Count) total .log files in directory"
+        
+        $recentFiles = $allLogFiles | Where-Object { $_.LastWriteTime -ge $cutoffDate }
+        Write-DebugLog "Found $($recentFiles.Count) recent log files (within $DaysToLookBack days)"
+        
+        foreach ($file in $recentFiles) {
+            Write-DebugLog "  - File: $($file.Name), LastWriteTime: $($file.LastWriteTime), Size: $($file.Length) bytes"
+        }
+        
+        $sortedFiles = $recentFiles | Sort-Object LastWriteTime -Descending
+        Write-DebugLog "Returning $($sortedFiles.Count) files sorted by LastWriteTime descending"
+        
+        return $sortedFiles
     } catch {
-        Write-DebugLog "Failed to get log files in $LogDir: $_"
+        Write-DebugLog "Failed to get log files in ${LogDir}: $($_.Exception.Message)"
+        Write-Host "ERROR: Failed to get log files in ${LogDir}: $($_.Exception.Message)" -ForegroundColor Red
         return @()
     }
 }
 
 function Read-LogFileReverse {
     param($LogFile)
+    Write-DebugLog "Reading log file: $LogFile"
+    
+    if (!(Test-Path $LogFile)) {
+        Write-DebugLog "ERROR: Log file does not exist: $LogFile"
+        return @()
+    }
+    
     try {
-        [array]::Reverse(($lines = Get-Content -Path $LogFile -Raw -ErrorAction Stop -Encoding UTF8).Split("`n"))
+        $fileInfo = Get-Item $LogFile
+        Write-DebugLog "File size: $($fileInfo.Length) bytes, LastWriteTime: $($fileInfo.LastWriteTime)"
+        
+        $content = Get-Content -Path $LogFile -Raw -ErrorAction Stop -Encoding UTF8
+        if ([string]::IsNullOrEmpty($content)) {
+            Write-DebugLog "WARNING: Log file is empty: $LogFile"
+            return @()
+        }
+        
+        $lines = $content.Split("`n")
+        Write-DebugLog "Read $($lines.Count) lines from log file"
+        
+        [array]::Reverse($lines)
+        Write-DebugLog "Reversed line order for processing (newest first)"
+        
         return $lines
     } catch {
-        Write-DebugLog "Failed to read log file $LogFile: $_"
+        Write-DebugLog "Failed to read log file ${LogFile}: $($_.Exception.Message)"
+        Write-Host "ERROR: Failed to read log file ${LogFile}: $($_.Exception.Message)" -ForegroundColor Red
         return @()
     }
 }
 
 function Detect-RunsInLog {
     param($Lines, $ErrorKeywords)
+    Write-DebugLog "Analyzing $($Lines.Count) lines for scenario runs"
+    
     $runs = @()
     $currentRun = $null
     $startPattern = '^(?<ts>\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}\.\d{3})\s+Starting Connect-It'
     $endPattern = '^(?<ts>\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}\.\d{3})\s+Operation completed \(RC=(?<rc>\d+)\)'
+    
+    Write-DebugLog "Using patterns - Start: '$startPattern', End: '$endPattern'"
+    
     for ($i = 0; $i -lt $Lines.Count; $i++) {
-        $line = $Lines[$i]
+        $line = $Lines[$i].Trim()
+        
         if ($line -match $endPattern) {
+            Write-DebugLog "Found END marker at line ${i}: $line"
             $currentRun = @{
                 EndTime = $matches['ts']
                 RC = $matches['rc']
@@ -72,51 +164,91 @@ function Detect-RunsInLog {
                 ErrorCount = 0
                 Status = if ($matches['rc'] -eq '0') { 'Success' } else { 'Failed' }
             }
+            Write-DebugLog "  - EndTime: $($currentRun.EndTime), RC: $($currentRun.RC), Status: $($currentRun.Status)"
         } elseif ($line -match $startPattern -and $currentRun) {
+            Write-DebugLog "Found START marker at line ${i}: $line"
             $currentRun.StartTime = $matches['ts']
             $currentRun.StartIdx = $i
-            # Extract run lines
+            Write-DebugLog "  - StartTime: $($currentRun.StartTime)"
+            
+            # Extract run lines between start and end
             $runLines = $Lines[$currentRun.EndIdx..$currentRun.StartIdx]
+            Write-DebugLog "  - Extracted $($runLines.Count) lines for this run"
+            
             $foundKeywords = @()
             foreach ($kw in $ErrorKeywords) {
                 $matchesCount = ($runLines | Select-String -Pattern $kw -SimpleMatch).Count
-                if ($matchesCount -gt 0) { $foundKeywords += $kw }
+                if ($matchesCount -gt 0) { 
+                    $foundKeywords += $kw 
+                    Write-DebugLog "  - Found $matchesCount occurrences of keyword '$kw'"
+                }
                 $currentRun.ErrorCount += $matchesCount
             }
             $currentRun.KeywordsFound = $foundKeywords -join ', '
             $currentRun.Status = if ($currentRun.Status -eq 'Success') { 'Success' } elseif ($currentRun.ErrorCount -gt 0) { 'Failed' } else { $currentRun.Status }
+            
+            Write-DebugLog "  - Final Status: $($currentRun.Status), ErrorCount: $($currentRun.ErrorCount), Keywords: $($currentRun.KeywordsFound)"
+            
             $runs += $currentRun
             $currentRun = $null
         }
     }
-    # Handle incomplete run
+    
+    # Handle incomplete run (found end but no start)
     if ($currentRun) {
+        Write-DebugLog "Found incomplete run (end marker without start marker)"
         $currentRun.Status = 'Incomplete'
         $runs += $currentRun
     }
+    
+    Write-DebugLog "Total runs detected: $($runs.Count)"
     return $runs
 }
 
 function Calculate-RunDuration {
     param($Start, $End)
+    Write-DebugLog "Calculating duration between Start: '$Start' and End: '$End'"
+    
+    if ([string]::IsNullOrEmpty($Start) -or [string]::IsNullOrEmpty($End)) {
+        Write-DebugLog "WARNING: Start or End time is empty"
+        return 'N/A'
+    }
+    
     try {
         $startDT = [datetime]::ParseExact($Start, 'yyyy/MM/dd HH:mm:ss.fff', $null)
         $endDT = [datetime]::ParseExact($End, 'yyyy/MM/dd HH:mm:ss.fff', $null)
-        return ($endDT - $startDT).ToString()
+        $duration = ($endDT - $startDT)
+        $durationStr = $duration.ToString()
+        Write-DebugLog "Calculated duration: $durationStr"
+        return $durationStr
     } catch {
-        Write-DebugLog "Failed to parse duration: $_"
-        return ''
+        Write-DebugLog "Failed to parse duration - Start: '$Start', End: '$End', Error: $($_.Exception.Message)"
+        return 'Parse Error'
     }
 }
 
 function Get-LastSuccessTimestamp {
     param($Runs)
-    $success = $Runs | Where-Object { $_.Status -eq 'Success' } | Sort-Object EndTime -Descending | Select-Object -First 1
+    Write-DebugLog "Finding last success timestamp from $($Runs.Count) runs"
+    
+    $successfulRuns = $Runs | Where-Object { $_.Status -eq 'Success' }
+    Write-DebugLog "Found $($successfulRuns.Count) successful runs"
+    
+    if ($successfulRuns.Count -eq 0) {
+        Write-DebugLog "No successful runs found"
+        return $null
+    }
+    
+    $success = $successfulRuns | Sort-Object EndTime -Descending | Select-Object -First 1
+    Write-DebugLog "Most recent success EndTime: $($success.EndTime)"
+    
     if ($success) {
         try {
-            return [datetime]::ParseExact($success.EndTime, 'yyyy/MM/dd HH:mm:ss.fff', $null)
+            $timestamp = [datetime]::ParseExact($success.EndTime, 'yyyy/MM/dd HH:mm:ss.fff', $null)
+            Write-DebugLog "Parsed last success timestamp: $timestamp"
+            return $timestamp
         } catch {
-            Write-DebugLog "Failed to parse last success timestamp: $_"
+            Write-DebugLog "Failed to parse last success timestamp '$($success.EndTime)': $($_.Exception.Message)"
             return $null
         }
     }
@@ -125,86 +257,209 @@ function Get-LastSuccessTimestamp {
 
 function Generate-HTMLReport {
     param($ScenarioResults)
+    Write-DebugLog "Generating HTML report for $($ScenarioResults.Count) scenarios"
+    
     $date = Get-Date -Format 'yyyyMMdd'
     $htmlPath = Join-Path $ReportOutputPath "summary-$date.html"
+    Write-DebugLog "HTML report path: $htmlPath"
+    
     $html = @"
 <html><head><title>Scenario Execution Report $date</title>
 <style>
-table { border-collapse: collapse; width: 100%; }
+table { border-collapse: collapse; width: 100%; margin-bottom: 20px; }
 th, td { border: 1px solid #ccc; padding: 6px; text-align: left; }
 th { background: #eee; }
 .success { background: #cfc; }
 .failed { background: #fcc; }
 .incomplete { background: #ffc; }
+h1 { color: #333; }
+h2 { color: #666; margin-top: 30px; }
+.summary { background: #f9f9f9; padding: 10px; margin-bottom: 20px; border-left: 4px solid #007acc; }
 </style></head><body>
 <h1>Scenario Execution Report - $date</h1>
+<div class="summary">
+<strong>Analysis Summary:</strong><br/>
+- Report generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')<br/>
+- Days analyzed: $DaysToLookBack days<br/>
+- Scenarios processed: $($ScenarioResults.Count)<br/>
+- Debug log: $DebugLog
+</div>
 "@
+
+    $totalRuns = 0
     foreach ($result in $ScenarioResults) {
-        $html += "<h2>$($result.ScenarioName)</h2>"
-        $html += "<table><tr><th>Run Date</th><th>Start Time</th><th>End Time</th><th>Duration</th><th>Status</th><th>Error Count</th><th>Time Since Last Success</th><th>Keywords Found</th><th>Log File</th></tr>"
-        foreach ($run in $result.Runs) {
-            $rowClass = switch ($run.Status) {
-                'Success' { 'success' }
-                'Failed' { 'failed' }
-                'Incomplete' { 'incomplete' }
-                default { '' }
+        $runCount = $result.Runs.Count
+        $totalRuns += $runCount
+        Write-DebugLog "Adding scenario '$($result.ScenarioName)' with $runCount runs to report"
+        
+        $html += "<h2>$($result.ScenarioName) ($runCount runs)</h2>"
+        
+        if ($runCount -eq 0) {
+            $html += "<p><em>No runs found for this scenario.</em></p>"
+        } else {
+            $html += "<table><tr><th>Run Date</th><th>Start Time</th><th>End Time</th><th>Duration</th><th>Status</th><th>Error Count</th><th>Time Since Last Success</th><th>Keywords Found</th><th>Log File</th></tr>"
+            
+            foreach ($run in $result.Runs) {
+                $rowClass = switch ($run.Status) {
+                    'Success' { 'success' }
+                    'Failed' { 'failed' }
+                    'Incomplete' { 'incomplete' }
+                    default { '' }
+                }
+                $runDate = if ($run.EndTime) { $run.EndTime.Split(' ')[0] } else { 'N/A' }
+                $html += "<tr class='$rowClass'><td>$runDate</td><td>$($run.StartTime)</td><td>$($run.EndTime)</td><td>$($run.Duration)</td><td>$($run.Status)</td><td>$($run.ErrorCount)</td><td>$($run.TimeSinceLastSuccess)</td><td>$($run.KeywordsFound)</td><td>$($run.LogFile)</td></tr>"
             }
-            $html += "<tr class='$rowClass'><td>$($run.EndTime.Split(' ')[0])</td><td>$($run.StartTime)</td><td>$($run.EndTime)</td><td>$($run.Duration)</td><td>$($run.Status)</td><td>$($run.ErrorCount)</td><td>$($run.TimeSinceLastSuccess)</td><td>$($run.KeywordsFound)</td><td>$($run.LogFile)</td></tr>"
+            $html += "</table>"
         }
-        $html += "</table>"
     }
+    
+    $html += "<div class='summary'><strong>Total runs across all scenarios: $totalRuns</strong></div>"
     $html += "</body></html>"
-    $null = New-Item -ItemType Directory -Path $ReportOutputPath -Force
-    Set-Content -Path $htmlPath -Value $html -Encoding UTF8
-    return $htmlPath
+    
+    try {
+        $null = New-Item -ItemType Directory -Path $ReportOutputPath -Force
+        Set-Content -Path $htmlPath -Value $html -Encoding UTF8
+        Write-DebugLog "HTML report successfully written to: $htmlPath"
+        return $htmlPath
+    } catch {
+        Write-DebugLog "ERROR: Failed to write HTML report: $($_.Exception.Message)"
+        Write-Host "ERROR: Failed to write HTML report: $($_.Exception.Message)" -ForegroundColor Red
+        return $null
+    }
 }
 
 function Send-EmailReport {
     param($HtmlPath)
+    Write-DebugLog "Checking email configuration - SendEmail: $SendEmail, SMTP Settings count: $($SMTPSettings.Count)"
+    
     # Only if $SendEmail is true and $SMTPSettings is set
     if ($SendEmail -and $SMTPSettings.Count -gt 0) {
+        Write-DebugLog "Email sending enabled, attempting to send report"
+        
+        if (!(Test-Path $HtmlPath)) {
+            Write-DebugLog "ERROR: HTML report file not found: $HtmlPath"
+            return
+        }
+        
         try {
             $body = Get-Content -Path $HtmlPath -Raw
-            Send-MailMessage @SMTPSettings -Body $body -BodyAsHtml -Subject "Scenario Execution Report" -Attachments $HtmlPath
+            Write-DebugLog "Loaded HTML report content ($(($body).Length) characters)"
+            
+            $subject = "Scenario Execution Report - $(Get-Date -Format 'yyyy-MM-dd')"
+            Write-DebugLog "Sending email with subject: $subject"
+            
+            Send-MailMessage @SMTPSettings -Body $body -BodyAsHtml -Subject $subject -Attachments $HtmlPath
+            Write-DebugLog "Email sent successfully"
         } catch {
-            Write-DebugLog "Failed to send email: $_"
+            Write-DebugLog "Failed to send email: $($_.Exception.Message)"
+            Write-Host "WARNING: Failed to send email: $($_.Exception.Message)" -ForegroundColor Yellow
         }
+    } else {
+        Write-DebugLog "Email sending disabled or not configured"
     }
 }
 
 #endregion
 
 #region Main Logic
+Write-DebugLog "=== STARTING SCENARIO LOG ANALYSIS ==="
+Write-DebugLog "Configuration: DaysToLookBack=$DaysToLookBack, MaxRunsPerScenario=$MaxRunsPerScenario"
+Write-DebugLog "Report Output Path: $ReportOutputPath"
+
 $scenarios = Import-Scenarios
+if ($scenarios.Count -eq 0) {
+    Write-DebugLog "ERROR: No scenarios loaded. Exiting."
+    Write-Host "ERROR: No scenarios loaded. Please check scenarios.csv file." -ForegroundColor Red
+    exit 1
+}
+
 $errorKeywords = Import-ErrorKeywords
+if ($errorKeywords.Count -eq 0) {
+    Write-DebugLog "WARNING: No error keywords loaded."
+    Write-Host "WARNING: No error keywords loaded. Please check errors.csv file." -ForegroundColor Yellow
+}
+
 $ScenarioResults = @()
+
 foreach ($scenario in $scenarios) {
+    Write-DebugLog "=== PROCESSING SCENARIO: $($scenario.ScenarioName) ==="
+    Write-Host "Processing scenario: $($scenario.ScenarioName)" -ForegroundColor Cyan
+    
     $logFiles = Get-RecentLogFilesDescending -LogDir $scenario.LogFilePath
+    if ($logFiles.Count -eq 0) {
+        Write-DebugLog "WARNING: No recent log files found for scenario $($scenario.ScenarioName)"
+        Write-Host "  WARNING: No recent log files found" -ForegroundColor Yellow
+        continue
+    }
+    
     $allRuns = @()
+    
     foreach ($logFile in $logFiles) {
+        Write-DebugLog "--- Processing log file: $($logFile.Name) ---"
+        Write-Host "  Processing file: $($logFile.Name)" -ForegroundColor Gray
+        
         $lines = Read-LogFileReverse -LogFile $logFile.FullName
+        if ($lines.Count -eq 0) {
+            Write-DebugLog "WARNING: No lines read from log file $($logFile.Name)"
+            continue
+        }
+        
         $runs = Detect-RunsInLog -Lines $lines -ErrorKeywords $errorKeywords
+        Write-DebugLog "Found $($runs.Count) runs in file $($logFile.Name)"
+        
         foreach ($run in $runs) {
             $run.LogFile = $logFile.Name
-            $run.Duration = if ($run.StartTime -and $run.EndTime) { Calculate-RunDuration $run.StartTime $run.EndTime } else { '' }
+            $run.Duration = if ($run.StartTime -and $run.EndTime) { 
+                Calculate-RunDuration $run.StartTime $run.EndTime 
+            } else { 
+                '' 
+            }
             $allRuns += $run
-            if ($allRuns.Count -ge $MaxRunsPerScenario) { break }
+            Write-DebugLog "Added run: Status=$($run.Status), StartTime=$($run.StartTime), EndTime=$($run.EndTime), Duration=$($run.Duration)"
+            
+            if ($allRuns.Count -ge $MaxRunsPerScenario) { 
+                Write-DebugLog "Reached MaxRunsPerScenario limit ($MaxRunsPerScenario), stopping file processing"
+                break 
+            }
         }
         if ($allRuns.Count -ge $MaxRunsPerScenario) { break }
     }
+    
+    Write-DebugLog "Total runs collected for scenario $($scenario.ScenarioName): $($allRuns.Count)"
+    
+    # Calculate time since last success
     $lastSuccess = Get-LastSuccessTimestamp -Runs $allRuns
+    if ($lastSuccess) {
+        Write-DebugLog "Last success timestamp: $lastSuccess"
+    } else {
+        Write-DebugLog "No successful runs found for scenario $($scenario.ScenarioName)"
+    }
+    
     foreach ($run in $allRuns) {
-        if ($lastSuccess -and $run.Status -eq 'Success') {
+        if ($lastSuccess) {
             $run.TimeSinceLastSuccess = (New-TimeSpan -Start $lastSuccess -End (Get-Date)).ToString()
         } else {
-            $run.TimeSinceLastSuccess = ''
+            $run.TimeSinceLastSuccess = 'No recent success'
         }
     }
+    
     $ScenarioResults += [PSCustomObject]@{
         ScenarioName = $scenario.ScenarioName
         Runs = $allRuns
     }
+    
+    Write-Host "  Completed: $($allRuns.Count) runs found" -ForegroundColor Green
 }
+
+Write-DebugLog "=== GENERATING REPORT ==="
+Write-Host "Generating HTML report..." -ForegroundColor Cyan
+
 $htmlPath = Generate-HTMLReport -ScenarioResults $ScenarioResults
+Write-DebugLog "HTML report generated: $htmlPath"
+Write-Host "Report generated: $htmlPath" -ForegroundColor Green
+
 Send-EmailReport -HtmlPath $htmlPath
+
+Write-DebugLog "=== ANALYSIS COMPLETE ==="
+Write-Host "Analysis complete! Check debug log at: $DebugLog" -ForegroundColor Green
 #endregion

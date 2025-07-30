@@ -3,7 +3,33 @@ $DaysToLookBack = 2                 # Analyze logs from the last N days
 $MaxRunsPerScenario = 3             # Max valid runs to extract per scenario
 $ReportOutputPath = "C:\LogReports" # Where to save the HTML file
 $SendEmail = $false                 # Set to true to email the report
-$SMTPSettings = @{}                 # Only needed if emailing
+
+# SMTP Settings for Email Delivery
+# To enable email delivery:
+# 1. Set $SendEmail = $true above
+# 2. Configure the settings below with your SMTP server details
+$SMTPSettings = @{
+    # SmtpServer = "smtp.gmail.com"           # SMTP server address
+    # Port = 587                              # SMTP port (587 for TLS, 465 for SSL, 25 for basic)
+    # From = "your-email@gmail.com"           # Sender email address
+    # To = @("recipient1@company.com", "recipient2@company.com")  # Array of recipient emails
+    # Subject = "Scenario Execution Report - $(Get-Date -Format 'yyyy-MM-dd')"  # Email subject
+    # UseSsl = $true                          # Use SSL/TLS encryption
+    # Credential = $null                      # Set this if authentication is required (see examples below)
+}
+
+# SMTP Authentication Examples:
+# For Gmail/Office365 with app passwords:
+# $SMTPSettings.Credential = New-Object System.Management.Automation.PSCredential("your-email@gmail.com", (ConvertTo-SecureString "your-app-password" -AsPlainText -Force))
+
+# For servers requiring authentication with username/password:
+# $SMTPSettings.Credential = Get-Credential  # This will prompt for credentials when script runs
+
+# Example configurations:
+# Gmail: SmtpServer="smtp.gmail.com", Port=587, UseSsl=$true, Credential required
+# Outlook/Hotmail: SmtpServer="smtp-mail.outlook.com", Port=587, UseSsl=$true, Credential required  
+# Office365: SmtpServer="smtp.office365.com", Port=587, UseSsl=$true, Credential required
+# Exchange Server: SmtpServer="your-exchange-server.com", Port=25, UseSsl=$false (internal network)
 
 # Ensure debug log directory exists before creating debug log path
 if (!(Test-Path $ReportOutputPath)) {
@@ -349,26 +375,101 @@ function Detect-RunsInLog {
 
 function Calculate-RunDuration {
     param($Start, $End)
-    try {
-        $startDT = [datetime]::ParseExact($Start, 'yyyy/MM/dd HH:mm:ss.fff', $null)
-        $endDT = [datetime]::ParseExact($End, 'yyyy/MM/dd HH:mm:ss.fff', $null)
-        return ($endDT - $startDT).ToString()
-    } catch {
-        Write-DebugLog "Failed to parse duration: $_"
+    
+    # Multiple timestamp formats to try
+    $formats = @(
+        'yyyy/MM/dd HH:mm:ss.fff',
+        'yyyy/MM/dd HH:mm:ss.ff',
+        'yyyy/MM/dd HH:mm:ss.f',
+        'yyyy/MM/dd HH:mm:ss',
+        'yyyy/MM/dd HH:mm:s.fff',
+        'yyyy/MM/dd HH:mm:s.ff',
+        'yyyy/MM/dd HH:mm:s.f',
+        'yyyy/MM/dd HH:mm:s',
+        'yyyy/MM/dd H:mm:ss.fff',
+        'yyyy/MM/dd H:mm:ss.ff',
+        'yyyy/MM/dd H:mm:ss.f',
+        'yyyy/MM/dd H:mm:ss',
+        'yyyy/MM/dd H:mm:s.fff',
+        'yyyy/MM/dd H:mm:s.ff',
+        'yyyy/MM/dd H:mm:s.f',
+        'yyyy/MM/dd H:mm:s'
+    )
+    
+    $startDT = $null
+    $endDT = $null
+    
+    # Parse start time
+    foreach ($format in $formats) {
+        try {
+            $startDT = [datetime]::ParseExact($Start, $format, $null)
+            Write-DebugLog "Successfully parsed start time '$Start' using format '$format'"
+            break
+        } catch {
+            # Continue to next format
+        }
+    }
+    
+    # Parse end time
+    foreach ($format in $formats) {
+        try {
+            $endDT = [datetime]::ParseExact($End, $format, $null)
+            Write-DebugLog "Successfully parsed end time '$End' using format '$format'"
+            break
+        } catch {
+            # Continue to next format
+        }
+    }
+    
+    if ($startDT -and $endDT) {
+        $duration = $endDT - $startDT
+        Write-DebugLog "Calculated duration: $($duration.ToString())"
+        return $duration.ToString()
+    } else {
+        Write-DebugLog "Failed to parse duration - Start: '$Start', End: '$End'"
         return ''
     }
 }
 
 function Get-LastSuccessTimestamp {
     param($Runs)
-    $success = $Runs | Where-Object { $_.Status -eq 'Success' } | Sort-Object EndTime -Descending | Select-Object -First 1
+    
+    # Include both 'Success' and 'Success with Warnings' as successful runs
+    $success = $Runs | Where-Object { $_.Status -eq 'Success' -or $_.Status -eq 'Success with Warnings' } | Sort-Object EndTime -Descending | Select-Object -First 1
+    
     if ($success) {
-        try {
-            return [datetime]::ParseExact($success.EndTime, 'yyyy/MM/dd HH:mm:ss.fff', $null)
-        } catch {
-            Write-DebugLog "Failed to parse last success timestamp: $_"
-            return $null
+        # Multiple timestamp formats to try
+        $formats = @(
+            'yyyy/MM/dd HH:mm:ss.fff',
+            'yyyy/MM/dd HH:mm:ss.ff',
+            'yyyy/MM/dd HH:mm:ss.f',
+            'yyyy/MM/dd HH:mm:ss',
+            'yyyy/MM/dd HH:mm:s.fff',
+            'yyyy/MM/dd HH:mm:s.ff',
+            'yyyy/MM/dd HH:mm:s.f',
+            'yyyy/MM/dd HH:mm:s',
+            'yyyy/MM/dd H:mm:ss.fff',
+            'yyyy/MM/dd H:mm:ss.ff',
+            'yyyy/MM/dd H:mm:ss.f',
+            'yyyy/MM/dd H:mm:ss',
+            'yyyy/MM/dd H:mm:s.fff',
+            'yyyy/MM/dd H:mm:s.ff',
+            'yyyy/MM/dd H:mm:s.f',
+            'yyyy/MM/dd H:mm:s'
+        )
+        
+        foreach ($format in $formats) {
+            try {
+                $timestamp = [datetime]::ParseExact($success.EndTime, $format, $null)
+                Write-DebugLog "Successfully parsed last success timestamp '$($success.EndTime)' using format '$format' -> Status: $($success.Status)"
+                return $timestamp
+            } catch {
+                # Continue to next format
+            }
         }
+        
+        Write-DebugLog "Failed to parse last success timestamp: $($success.EndTime)"
+        return $null
     }
     return $null
 }
@@ -450,13 +551,66 @@ h2 { color: #666; margin-top: 30px; }
 
 function Send-EmailReport {
     param($HtmlPath)
-    # Only if $SendEmail is true and $SMTPSettings is set
-    if ($SendEmail -and $SMTPSettings.Count -gt 0) {
-        try {
-            $body = Get-Content -Path $HtmlPath -Raw
-            Send-MailMessage @SMTPSettings -Body $body -BodyAsHtml -Subject "Scenario Execution Report" -Attachments $HtmlPath
-        } catch {
-            Write-DebugLog "Failed to send email: $_"
+    
+    if (!$SendEmail) {
+        Write-DebugLog "Email delivery disabled (SendEmail = false)"
+        return
+    }
+    
+    if ($SMTPSettings.Count -eq 0) {
+        Write-DebugLog "WARNING: Email delivery enabled but no SMTP settings configured"
+        Write-Host "WARNING: Email delivery enabled but no SMTP settings configured. Please configure SMTPSettings." -ForegroundColor Yellow
+        return
+    }
+    
+    # Validate required SMTP settings
+    $requiredSettings = @('SmtpServer', 'From', 'To')
+    $missingSettings = @()
+    foreach ($setting in $requiredSettings) {
+        if (!$SMTPSettings.ContainsKey($setting) -or [string]::IsNullOrEmpty($SMTPSettings[$setting])) {
+            $missingSettings += $setting
+        }
+    }
+    
+    if ($missingSettings.Count -gt 0) {
+        $missingList = $missingSettings -join ', '
+        Write-DebugLog "ERROR: Missing required SMTP settings: $missingList"
+        Write-Host "ERROR: Missing required SMTP settings: $missingList" -ForegroundColor Red
+        return
+    }
+    
+    try {
+        Write-DebugLog "Attempting to send email report via $($SMTPSettings.SmtpServer)"
+        Write-Host "Sending email report..." -ForegroundColor Cyan
+        
+        $emailParams = $SMTPSettings.Clone()
+        
+        # Set default subject if not provided
+        if (!$emailParams.ContainsKey('Subject')) {
+            $emailParams.Subject = "Scenario Execution Report - $(Get-Date -Format 'yyyy-MM-dd')"
+        }
+        
+        # Read HTML content for email body
+        $body = Get-Content -Path $HtmlPath -Raw -Encoding UTF8
+        $emailParams.Body = $body
+        $emailParams.BodyAsHtml = $true
+        $emailParams.Attachments = $HtmlPath
+        
+        Send-MailMessage @emailParams
+        
+        Write-DebugLog "Email sent successfully to: $($SMTPSettings.To -join ', ')"
+        Write-Host "Email sent successfully!" -ForegroundColor Green
+        
+    } catch {
+        Write-DebugLog "Failed to send email: $($_.Exception.Message)"
+        Write-Host "ERROR: Failed to send email: $($_.Exception.Message)" -ForegroundColor Red
+        
+        # Provide helpful troubleshooting information
+        if ($_.Exception.Message -like "*authentication*" -or $_.Exception.Message -like "*login*") {
+            Write-Host "HINT: Check your SMTP credentials. For Gmail/Office365, you may need an app-specific password." -ForegroundColor Yellow
+        }
+        elseif ($_.Exception.Message -like "*connection*" -or $_.Exception.Message -like "*timeout*") {
+            Write-Host "HINT: Check your SMTP server address, port, and SSL settings." -ForegroundColor Yellow
         }
     }
 }

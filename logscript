@@ -146,13 +146,27 @@ function Detect-RunsInLog {
     
     $runs = @()
     $currentRun = $null
-    $startPattern = '^(?<ts>\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}\.\d{3})\s+Starting Connect-It'
-    $endPattern = '^(?<ts>\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}\.\d{3})\s+Operation completed \(RC=(?<rc>\d+)\)'
+    # More flexible timestamp patterns to handle different formats
+    $startPattern = '^(?<ts>\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}(?:\.\d{3})?)\s+.*Starting Connect-It'
+    $endPattern = '^(?<ts>\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}(?:\.\d{3})?)\s+.*Operation completed.*\(RC=(?<rc>\d+)\)'
     
     Write-DebugLog "Using patterns - Start: '$startPattern', End: '$endPattern'"
     
+    # Add debug logging for first few lines to see actual format
+    Write-DebugLog "Sample lines for pattern matching:"
+    for ($j = 0; $j -lt [Math]::Min(10, $Lines.Count); $j++) {
+        if (![string]::IsNullOrWhiteSpace($Lines[$j])) {
+            Write-DebugLog "  Line $j`: $($Lines[$j].Trim())"
+        }
+    }
+    
     for ($i = 0; $i -lt $Lines.Count; $i++) {
         $line = $Lines[$i].Trim()
+        
+        # Skip empty lines
+        if ([string]::IsNullOrWhiteSpace($line)) {
+            continue
+        }
         
         if ($line -match $endPattern) {
             Write-DebugLog "Found END marker at line ${i}: $line"
@@ -185,7 +199,12 @@ function Detect-RunsInLog {
                 $currentRun.ErrorCount += $matchesCount
             }
             $currentRun.KeywordsFound = $foundKeywords -join ', '
-            $currentRun.Status = if ($currentRun.Status -eq 'Success') { 'Success' } elseif ($currentRun.ErrorCount -gt 0) { 'Failed' } else { $currentRun.Status }
+            
+            # Update status based on error keywords found
+            if ($currentRun.Status -eq 'Success' -and $currentRun.ErrorCount -gt 0) {
+                $currentRun.Status = 'Success with Warnings'
+                Write-DebugLog "  - Status updated to 'Success with Warnings' due to error keywords found"
+            }
             
             Write-DebugLog "  - Final Status: $($currentRun.Status), ErrorCount: $($currentRun.ErrorCount), Keywords: $($currentRun.KeywordsFound)"
             
@@ -207,48 +226,24 @@ function Detect-RunsInLog {
 
 function Calculate-RunDuration {
     param($Start, $End)
-    Write-DebugLog "Calculating duration between Start: '$Start' and End: '$End'"
-    
-    if ([string]::IsNullOrEmpty($Start) -or [string]::IsNullOrEmpty($End)) {
-        Write-DebugLog "WARNING: Start or End time is empty"
-        return 'N/A'
-    }
-    
     try {
         $startDT = [datetime]::ParseExact($Start, 'yyyy/MM/dd HH:mm:ss.fff', $null)
         $endDT = [datetime]::ParseExact($End, 'yyyy/MM/dd HH:mm:ss.fff', $null)
-        $duration = ($endDT - $startDT)
-        $durationStr = $duration.ToString()
-        Write-DebugLog "Calculated duration: $durationStr"
-        return $durationStr
+        return ($endDT - $startDT).ToString()
     } catch {
-        Write-DebugLog "Failed to parse duration - Start: '$Start', End: '$End', Error: $($_.Exception.Message)"
-        return 'Parse Error'
+        Write-DebugLog "Failed to parse duration: $_"
+        return ''
     }
 }
 
 function Get-LastSuccessTimestamp {
     param($Runs)
-    Write-DebugLog "Finding last success timestamp from $($Runs.Count) runs"
-    
-    $successfulRuns = $Runs | Where-Object { $_.Status -eq 'Success' }
-    Write-DebugLog "Found $($successfulRuns.Count) successful runs"
-    
-    if ($successfulRuns.Count -eq 0) {
-        Write-DebugLog "No successful runs found"
-        return $null
-    }
-    
-    $success = $successfulRuns | Sort-Object EndTime -Descending | Select-Object -First 1
-    Write-DebugLog "Most recent success EndTime: $($success.EndTime)"
-    
+    $success = $Runs | Where-Object { $_.Status -eq 'Success' } | Sort-Object EndTime -Descending | Select-Object -First 1
     if ($success) {
         try {
-            $timestamp = [datetime]::ParseExact($success.EndTime, 'yyyy/MM/dd HH:mm:ss.fff', $null)
-            Write-DebugLog "Parsed last success timestamp: $timestamp"
-            return $timestamp
+            return [datetime]::ParseExact($success.EndTime, 'yyyy/MM/dd HH:mm:ss.fff', $null)
         } catch {
-            Write-DebugLog "Failed to parse last success timestamp '$($success.EndTime)': $($_.Exception.Message)"
+            Write-DebugLog "Failed to parse last success timestamp: $_"
             return $null
         }
     }
@@ -272,6 +267,7 @@ th { background: #eee; }
 .success { background: #cfc; }
 .failed { background: #fcc; }
 .incomplete { background: #ffc; }
+.success-with-warnings { background: #ffe6cc; }
 h1 { color: #333; }
 h2 { color: #666; margin-top: 30px; }
 .summary { background: #f9f9f9; padding: 10px; margin-bottom: 20px; border-left: 4px solid #007acc; }
@@ -302,6 +298,7 @@ h2 { color: #666; margin-top: 30px; }
             foreach ($run in $result.Runs) {
                 $rowClass = switch ($run.Status) {
                     'Success' { 'success' }
+                    'Success with Warnings' { 'success-with-warnings' }
                     'Failed' { 'failed' }
                     'Incomplete' { 'incomplete' }
                     default { '' }
@@ -330,32 +327,14 @@ h2 { color: #666; margin-top: 30px; }
 
 function Send-EmailReport {
     param($HtmlPath)
-    Write-DebugLog "Checking email configuration - SendEmail: $SendEmail, SMTP Settings count: $($SMTPSettings.Count)"
-    
     # Only if $SendEmail is true and $SMTPSettings is set
     if ($SendEmail -and $SMTPSettings.Count -gt 0) {
-        Write-DebugLog "Email sending enabled, attempting to send report"
-        
-        if (!(Test-Path $HtmlPath)) {
-            Write-DebugLog "ERROR: HTML report file not found: $HtmlPath"
-            return
-        }
-        
         try {
             $body = Get-Content -Path $HtmlPath -Raw
-            Write-DebugLog "Loaded HTML report content ($(($body).Length) characters)"
-            
-            $subject = "Scenario Execution Report - $(Get-Date -Format 'yyyy-MM-dd')"
-            Write-DebugLog "Sending email with subject: $subject"
-            
-            Send-MailMessage @SMTPSettings -Body $body -BodyAsHtml -Subject $subject -Attachments $HtmlPath
-            Write-DebugLog "Email sent successfully"
+            Send-MailMessage @SMTPSettings -Body $body -BodyAsHtml -Subject "Scenario Execution Report" -Attachments $HtmlPath
         } catch {
-            Write-DebugLog "Failed to send email: $($_.Exception.Message)"
-            Write-Host "WARNING: Failed to send email: $($_.Exception.Message)" -ForegroundColor Yellow
+            Write-DebugLog "Failed to send email: $_"
         }
-    } else {
-        Write-DebugLog "Email sending disabled or not configured"
     }
 }
 

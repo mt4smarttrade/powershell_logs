@@ -1,0 +1,94 @@
+# Debug script to test log pattern matching
+param(
+    [string]$LogFile = "TestLogs\REFERENTIALS_DALI_2_SMAX_SERVER\Log\referentials_20250730.log"
+)
+
+Write-Host "Debugging log patterns for file: $LogFile" -ForegroundColor Cyan
+
+if (!(Test-Path $LogFile)) {
+    Write-Host "ERROR: Log file not found: $LogFile" -ForegroundColor Red
+    exit 1
+}
+
+# Read the log file
+$lines = Get-Content -Path $LogFile
+
+Write-Host "`nTotal lines in file: $($lines.Count)" -ForegroundColor Yellow
+
+# Test different patterns
+$startPatterns = @(
+    '^(?<ts>\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}\.\d{3})\s+Starting Connect-It',
+    '^(?<ts>\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}(?:\.\d{3})?)\s+.*Starting Connect-It',
+    'Starting Connect-It',
+    '.*Starting Connect-It.*'
+)
+
+$endPatterns = @(
+    '^(?<ts>\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}\.\d{3})\s+Operation completed \(RC=(?<rc>\d+)\)',
+    '^(?<ts>\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}(?:\.\d{3})?)\s+.*Operation completed.*\(RC=(?<rc>\d+)\)',
+    'Operation completed.*RC=',
+    '.*Operation completed.*'
+)
+
+Write-Host "`n=== Testing START patterns ===" -ForegroundColor Green
+for ($i = 0; $i -lt $startPatterns.Count; $i++) {
+    $pattern = $startPatterns[$i]
+    Write-Host "`nPattern $($i+1): $pattern" -ForegroundColor White
+    
+    $matchResults = $lines | Select-String -Pattern $pattern
+    Write-Host "  Matches found: $($matchResults.Count)" -ForegroundColor $(if ($matchResults.Count -gt 0) { 'Green' } else { 'Red' })
+    
+    if ($matchResults.Count -gt 0) {
+        foreach ($match in $matchResults[0..2]) {  # Show first 3 matches
+            Write-Host "    Line $($match.LineNumber): $($match.Line)" -ForegroundColor Gray
+        }
+        if ($matchResults.Count -gt 3) {
+            Write-Host "    ... and $($matchResults.Count - 3) more matches" -ForegroundColor Gray
+        }
+    }
+}
+
+Write-Host "`n=== Testing END patterns ===" -ForegroundColor Green
+for ($i = 0; $i -lt $endPatterns.Count; $i++) {
+    $pattern = $endPatterns[$i]
+    Write-Host "`nPattern $($i+1): $pattern" -ForegroundColor White
+    
+    $matchResults = $lines | Select-String -Pattern $pattern
+    Write-Host "  Matches found: $($matchResults.Count)" -ForegroundColor $(if ($matchResults.Count -gt 0) { 'Green' } else { 'Red' })
+    
+    if ($matchResults.Count -gt 0) {
+        foreach ($match in $matchResults[0..2]) {  # Show first 3 matches
+            Write-Host "    Line $($match.LineNumber): $($match.Line)" -ForegroundColor Gray
+        }
+        if ($matchResults.Count -gt 3) {
+            Write-Host "    ... and $($matchResults.Count - 3) more matches" -ForegroundColor Gray
+        }
+    }
+}
+
+Write-Host "`n=== Sample lines from the log ===" -ForegroundColor Cyan
+Write-Host "First 10 non-empty lines:" -ForegroundColor Yellow
+$nonEmptyLines = $lines | Where-Object { ![string]::IsNullOrWhiteSpace($_) }
+for ($i = 0; $i -lt [Math]::Min(10, $nonEmptyLines.Count); $i++) {
+    Write-Host "  Line $($i+1): $($nonEmptyLines[$i])" -ForegroundColor Gray
+}
+
+Write-Host "`nLast 10 non-empty lines:" -ForegroundColor Yellow
+$lastLines = $nonEmptyLines | Select-Object -Last 10
+for ($i = 0; $i -lt $lastLines.Count; $i++) {
+    Write-Host "  Line $($nonEmptyLines.Count - $lastLines.Count + $i + 1): $($lastLines[$i])" -ForegroundColor Gray
+}
+
+Write-Host "`n=== Looking for specific keywords ===" -ForegroundColor Cyan
+$keywords = @('Starting Connect-It', 'Operation completed', 'RC=')
+foreach ($keyword in $keywords) {
+    $matchResults = $lines | Select-String -Pattern $keyword -SimpleMatch
+    Write-Host "Keyword '$keyword': $($matchResults.Count) matches" -ForegroundColor $(if ($matchResults.Count -gt 0) { 'Green' } else { 'Red' })
+    if ($matchResults.Count -gt 0 -and $matchResults.Count -le 5) {
+        foreach ($match in $matchResults) {
+            Write-Host "  Line $($match.LineNumber): $($match.Line)" -ForegroundColor Gray
+        }
+    }
+}
+
+Write-Host "`nDebug complete!" -ForegroundColor Green
